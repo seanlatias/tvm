@@ -231,14 +231,14 @@ def lower(sch,
     for f in lower_phase2:
         stmt = f(stmt)
     # Phase 2
-    stmt = ir_pass.Simplify(stmt)
+    #stmt = ir_pass.Simplify(stmt)
     stmt = ir_pass.LowerStorageAccessInfo(stmt)
     stmt = ir_pass.RemoveNoOp(stmt)
     stmt = ir_pass.RewriteUnsafeSelect(stmt)
     for f in lower_phase3:
         stmt = f(stmt)
     if simple_mode:
-        return stmt
+        return stmt, binds, arg_list
     return ir_pass.MakeAPI(stmt, name, arg_list, 0, cfg.restricted_func)
 
 
