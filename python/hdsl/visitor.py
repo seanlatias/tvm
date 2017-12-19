@@ -1,4 +1,5 @@
 import tvm, numpy, ast, inspect
+from mutator import IRMutator
 
 """A Python AST visitor that constructs Halide IR
 
@@ -65,27 +66,34 @@ class Visitor(ast.NodeVisitor):
     self.io_dict = {}
     self.var_dict = {}
     self.buffer_dict = {}
-    self.externs = {}
+    self.externs_dict = {}
     for f in extern_funcs:
-      self.externs[f] = ast.parse(extern_funcs[f]).body[0]
+      self.externs_dict[f] = ast.parse(extern_funcs[f]).body[0]
     self.arg_list = args
+    self.scope = 0
+    self.for_count = 0
 
     assert(isinstance(ast_root, ast.Module))
-    ir = self.visit(ast_root.body[0])
+    assert isinstance(ast_root.body[0], ast.FunctionDef), "Invalide input to mybuild"
+    ir = self.visit_body(ast_root.body[0].body)
+    """ FOR DEBUG
+    a= ir.body.body.body.first.body.rest.body.body.value.b.value
+    b= ir.body.body.body.first.body.rest.loop_var
+    print (a == b).__bool__()
+    """
+    print ir
     return ir
 
   def visit_body(self, nodes):
     """Visit a list of statements in the Python AST"""
 
-    if len(nodes) == 0:
-      # create a dummy statement node
+    if len(nodes) == 0: # create a dummy statement node
       return tvm.make.Evaluate(1)
     else:
       first = nodes[0]
       rest = nodes[1:]
       has_rest = len(rest) > 0
-      if (isinstance(node, ast.For) or isinstance(node, ast.If)):
-        # imperative code block
+      if (isinstance(first, ast.For) or isinstance(first, ast.If)): # imperative code block
         ir_first = self.visit(first)
         if has_rest:
           ir_rest = self.visit_body(rest)
@@ -97,231 +105,110 @@ class Visitor(ast.NodeVisitor):
         value = first.value
         if isinstance(value, ast.Call):
           types = self.check_call_type(value)
-          if len(types) == 2 and types[0] == "tvm":
-            ir_first = self.visit(first)
-            ir = ir_first
-            if has_rest:
-              ir_rest = self.visit_body(rest)
-              ir = tvm.make.Block(ir_first, ir_rest)
+          if len(types) == 2 and types[0] == "tvm": # tvm functions
             if types[1] == "compute":
               assert len(targets) == 1, "tvm.compute only has one output, instead of " + str(len(targets))
-              name = targets[0]
-              if name in arg_list:
+              ir = self.visit(first)
+              if has_rest:
+                ir = tvm.make.Block(ir, self.visit_body(rest))
+              name = targets[0].id
+              if name in self.arg_list:
                 return ir
               else:
-                assert name in self.buffer_dirct, "undeclared buffer " + name
-                buffer = self.buffer_dict[name]
+                buffer = self.get_buffer(name)
+                assert buffer, "Internal Error: Undeclared buffer " + name
                 return tvm.make.Allocate(buffer['buffer'].data, buffer['tensor'].dtype, \
                     buffer['shape'], self.true, ir)
-            else: # tvm.var must be in arg_list
+            elif types[1] == "placeholder":
+              assert len(targets) == 1, "tvm.placeholder only has one output, instead of " + str(len(targets))
+              if has_rest:
+                self.visit(first)
+                name = targets[0].id
+                buffer = self.get_buffer(name)
+                if name in self.arg_list:
+                  return self.visit_body(rest)
+                else:
+                  assert buffer, "Internal Error: Undeclared buffer " + name
+                  return tvm.make.Allocate(buffer['buffer'].data, buffer['tensor'].dtype, \
+                      buffer['shape'], self.true, self.visit_body(rest))
+              else: # last statement in the body, useless tvm.placeholder
+                return tvm.make.Evaluate(1)
+            else: # tvm.var  must be in arg_list
               assert len(targets) == 1, "tvm.var only has one output, instead of " + str(len(targets))
-              return ir
+              if has_rest:
+                self.visit(first)
+                return self.visit_body(rest)
+              else: # last statement in the body, useless tvm.var
+                return tvm.make.Evaluate(1)
+          else: # other function calls
+            ir_first = self.visit(value)
+            print "here"
+            if has_rest:
+              ir_rest = self.visit_body(rest)
+              return tvm.make.Block(ir_first, ir_rest)
+            else:
+              return ir_first
         else:
           # intermediate variable
-          ir_first = self.visit(first)
-          assert name in self.var_dict, "undecalred variable " + name
-          var = self.var_dict[name]
-          ir = ir_first
+          ir = self.visit(first)
+          target, name, _type = self.get_target(targets[0])
+          assert target, "Undeclared variable: " + name
+          if _type == 'name':
+            target['count'] += 1
           if has_rest:
             ir_rest = self.visit_body(rest)
-            ir = tvm.make.Block(ir_first, ir_rest)
-          if var['allocated']:
-            return ir
+            ir = tvm.make.Block(ir, ir_rest)
+          if _type == 'name':
+            if target['allocated'] == True:
+              return ir
+            else:
+              target['count'] -= 1
+              if target['count'] == 0:
+                target['allocated'] == True
+                return tvm.make.Allocate(target['var'], target['var'].dtype, [1], self.true, ir)
+              else:
+                return ir
           else:
-            return tvm.make.Allocate(var['var'], var['var'].dtype, [1], self.true, ir)
+            return ir
+      elif isinstance(first, ast.Call) or isinstance(first, ast.Expr):
+        ir = self.visit(first)
+        if isinstance(ir, tuple): # ignore return value
+          ir = ir[0]
+        if has_rest:
+          ir_rest = self.visit_body(rest)
+          return tvm.make.Block(ir, ir_rest)
+        else:
+          return ir
       else:
         # Not yet supported AST nodes: ClassDef, FunctionDef, Return, Print, While, With, Assert
         return self.visit_body(rest)
 
+  def visit_Expr(self, node):
+    return self.visit(node.value)
 
-
-    '''
-    # the last node
-    if len(nodes) == 1:
-      if isinstance(nodes[0], ast.For):
-        return self.visit(nodes[0])
-      elif isinstance(nodes[0], ast.Assign):
-        if isinstance(nodes[0].value, ast.Call):
-          return self.visit(nodes[0])
-        elif isinstance(nodes[0].value, ast.Num):
-          name = nodes[0].targets[0].id
-          if name in self.var_dict:
-            return tvm.make.Store(self.var_dict[name]['var'], nodes[0].value.n, 0)
-          else:
-            var = tvm.var(name, "int32")
-            store = tvm.make.Store(var, nodes[0].value.n, 0)
-            return tvm.make.Allocate(var, "int32", [1], true, store)
-        elif isinstance(nodes[0].value, ast.IfExp):
-          name = nodes[0].targets[0].id
-          cond = nodes[0].value.test
-          t = nodes[0].value.body
-          f = nodes[0].value.orelse
-          if isinstance(t, ast.Name):
-            t = self.var_dict[nodes[0].value.body.id]['var']
-          if isinstance(f, ast.Name):
-            f = self.var_dict[nodes[0].value.orelse.id]
-            if f['ast'] == None:
-              f = tvm.make.Load(f['var'].dtype, f['var'], 0)
-          if isinstance(cond, ast.Compare):
-            op = cond.ops[0]
-            lhs = self.visit(cond.left)
-            rhs = cond.comparators[0]
-            if isinstance(rhs, ast.Name):
-              rhs = self.var_dict[rhs.id]
-              if rhs['ast'] == None:
-                rhs = tvm.make.Load(rhs['var'].dtype, rhs['var'], 0)
-            if isinstance(cond.ops[0], ast.Gt):
-              cond = tvm.make.GT(lhs, rhs)
-          t = tvm.make.Cast(f.dtype, t)
-          sel = tvm.make.Select(cond, t, f)
-          var = self.var_dict[name]['var']
-          store = tvm.make.Store(var, sel, 0)
-          return store
-        elif isinstance(nodes[0].value, ast.Subscript):
-          rhs = self.visit(nodes[0].value)
-          node = nodes[0].targets[0]
-          name = node.slice.value.id
-          var2 = self.var_dict[name]
-          ld = tvm.make.Load(var2['var'].dtype, var2['var'], 0)
-          name = node.value.slice.value.id
-          var1 = self.var_dict[name]
-          name = node.value.value.id
-          buff = self.buffer_dict[name]['buffer']
-          store = tvm.make.Store(buff.data, rhs, var1['var'] * self.buffer_dict[name]['shape'][1] + ld)
-          return store
-
-      elif isinstance(nodes[0], ast.If):
-        cond = nodes[0].test
-        t = self.visit_body(nodes[0].body)
-        f = self.visit_body(nodes[0].orelse)
-        if isinstance(cond, ast.Compare):
-          op = cond.ops[0]
-          lhs = self.visit(cond.left)
-          rhs = cond.comparators[0]
-          if isinstance(rhs, ast.Name):
-            rhs = self.var_dict[rhs.id]
-            if rhs['ast'] == None:
-              rhs = tvm.make.Load(rhs['var'].dtype, rhs['var'], 0)
-          if isinstance(cond.ops[0], ast.Lt):
-            cond = tvm.make.LT(lhs, rhs)
-        ite = tvm.make.IfThenElse(cond, t, f)
-        print ite
-        return ite
-
-
-    elif len(nodes) == 0:
-      dum = tvm.var('dum')
-      store = tvm.make.Store(dum, 0, 0)
-      al = tvm.make.Allocate(dum, "int32", [1], self.true, store)
-      return al
-    else:
-      if isinstance(nodes[0], ast.For):
-        first = self.visit(nodes[0])
-        rest = self.visit_body(nodes[1:])
-        return tvm.make.Block(first, rest)
-      elif isinstance(nodes[0], ast.Assign):
-        name = nodes[0].targets[0].id
-        if isinstance(nodes[0].value, ast.Call):
-          first = self.visit(nodes[0])
-          rest = self.visit_body(nodes[1:])
-          if first == None:
-            return rest
-          else:
-            if name in self.buffer_dict:
-              var = self.buffer_dict[name]['buffer'].data
-              shape = self.buffer_dict[name]['shape']
-              return tvm.make.Allocate(var, "int32", [shape[0], shape[1]], self.true, tvm.make.Block(first, rest))
-            else:
-              return tvm.make.Block(first, rest)
-        elif isinstance(nodes[0].value, ast.Num):
-          if name in self.var_dict:
-            first = tvm.make.Store(self.var_dict[name]['var'], nodes[0].value.n, 0)
-            rest = self.visit_body(nodes[1:])
-            return tvm.make.Block(first, rest)
-          else:
-            var = tvm.var(name, "int32")
-            store = tvm.make.Store(var, nodes[0].value.n, 0)
-            self.var_dict[name] = {'var': var, 'ast': None}
-            rest = self.visit_body(nodes[1:])
-            return tvm.make.Allocate(var, "int32", [1], self.true, tvm.make.Block(store, rest))
-    '''
-
-  """ Main Visitors """
+  """ Statements """
 
   def visit_FunctionDef(self, node):
-    ir = self.visit_body(node.body)
-    print ir
-    buff = []
-    for n in self.io_dict:
-      buff.append(self.io_dict[n]['arg'])
-    api = tvm.ir_pass.MakeAPI(ir, 'IR', buff, 0, True)
-    func = tvm.build(api)
-    evaluator = func.time_evaluator(func.entry_name, tvm.cpu(0), number = 1)
-    from digitrec_data import read_digitrec_data
-    train_data, train_label, test_data, test_label = read_digitrec_data()
-    arr = numpy.zeros((10, 100), dtype = 'int32')
-    arr2 = numpy.zeros((10, 3), dtype = 'int32')
-    for i in range(0, 10):
-      for j in range(0, 100):
-        arr[i][j] = int(''.join(str(int(e)) for e in train_data[i][j]), 2)
-    input_image = int(''.join(str(int(e)) for e in test_data[0]), 2)
-    label_val = tvm.nd.array(arr, tvm.cpu(0))
-    knn_mat = tvm.nd.array(arr2, tvm.cpu(0))
-    evaluator(input_image, knn_mat, label_val)
-    print knn_mat
-
-  def visit_Subscript(self, node):
-    """Visit A[x] or A[x][y]
-
-    Returns
-    -------
-    Expr: x or x * extent + y
-    """
-    if isinstance(node.value, ast.Subscript):
-      # a 2D array
-      var2 = node.slice.value
-      if isinstance(var2, ast.Name):
-        var2 = self.var_dict[var2.id]['var']
-      else
-        var2 = var2.n
-      var1 = node.value.slice.value
-      if isinstance(var1, ast.Name):
-        var1 = self.var_dict[var1.id]['var']
-      else
-        var1 = var1.n
-      buffer_name = node.value.value.id
-      buffer_shape = self.buffer_dict[buffer_name]['shape']
-      return var1 * buffer_shape[1] + var2
+    body = node.body
+    stmt = None
+    ret = None
+    if isinstance(body[-1], ast.Return):
+      if len(body[0:-1]) > 0:
+        stmt = self.visit_body(body[0:-1])
+      ret = self.visit(body[-1])
     else:
-      var = node.slice.value
-      if isinstance(var, ast.Name):
-        var = self.var_dict[var.id]['var']
-      else:
-        var = var.n
-      return var
+      stmt = self.visit_body(body)
+    return (stmt, ret)
 
-  def visit_For(self, node):
-    """Visit for i in range(a, b)
-
-    Returns
-    -------
-    Stmt: For node
-    """
-    index = node.target.id
-    min_val = node.iter.args[0].n
-    max_val = node.iter.args[1].n
-    extent = max_val - min_val
-    var = tvm.var(index)
-    self.var_dict[index] = {'var': var, 'type': 'for', 'min': min_val, 'extent': extent, 'allocated': True}
-    stmt = self.visit_body(node.body)
-    return tvm.make.For(var, min_val, extent, 0, 0, stmt)
+  def visit_Return(self, node):
+    return self.visit(node.value)
 
   def visit_Assign(self, node):
     """Visit targets = value
 
     Returns
     -------
-    Stmt: Store node or tvm.compute IR
+    Stmt: Store node, tvm.var, tvm.buffer, or tvm.compute IR
     """
     # Currently, we only allow one output target
     target = node.targets[0]
@@ -334,7 +221,7 @@ class Visitor(ast.NodeVisitor):
     # Analyze right hand side first
     if isinstance(node.value, ast.Call):
       call = node.value
-      call_type = check_call_type(call)
+      call_type = self.check_call_type(call)
       if len(call_type) == 1:
         # External function call. We do not support it right now
         content = self.visit(call)
@@ -345,130 +232,307 @@ class Visitor(ast.NodeVisitor):
         if call_type[0] == "tvm":
           is_tvm = True
           if call_type[1] == "var": # tvm.var
-            assert(isinstance(target, ast.Name)), "target of tvm.var must be a name"
+            assert isinstance(target, ast.Name), "target of tvm.var must be a name"
             for keyword in keywords: # check every keyword in tvm.var
-              if keyword[0] == "dtype":
-                dtype = keyword[1].id
-              elif keyword[0] == "name":
+              if keyword.arg == "dtype":
+                dtype = keyword.value.s
+              elif keyword.arg == "name":
                 pass
               else:
                 raise ValueError("Unknown/Unsupported keyowrds to tvm.var: " + str(keyword[0]))
             name = target.id
-            var = tvm.var(name, dtype = dtype)
-            self.var_dict[name] = {'var': var, 'tpye': 'tvm', 'allocated': True}
+            tvm_var = tvm.var(name, dtype = dtype)
+            var = {'var': tvm_var, 'type': 'tvm', 'allocated': False}
             if name in self.arg_list: # check whether this var belongs to io
-              self.io_dict[name] = {'arg': var}
+              self.io_dict[name] = {'arg': tvm_var}
+              var['allocated'] = True
+            self.insert_var(name, var)
+            content = None
           elif call_type[1] == "placeholder": # tvm.placeholder
-            assert(isinstance(target, ast.Name)), "target of tvm.placeholder must be a name"
+            assert isinstance(target, ast.Name), "target of tvm.placeholder must be a name"
             for keyword in keywords: # check every keyword in tvm.var
-              if keyword[0] == "dtype":
-                dtype = keyword[1].id
-              elif keyword[0] == "name":
+              if keyword.arg == "dtype":
+                dtype = keyword.value.s
+              elif keyword.arg == "name":
                 pass
               else:
-                raise ValueError("Unknown/Unsupported keyowrds to tvm.var: " + str(keyword[0]))
-
-        else:
-          raise ValueError("Currently we only support tvm functions")
-
-      func = node.value.func
-      if (func.value.id == "tvm"):
-        if (func.attr == "var"): # a tvm variable
-          name = targets[0].id
-          var = tvm.var(name, "int32")
-          self.var_dict[name] = {'var': var, 'ast': node, 'input': True}
-          if name in self.arg_list:
-            self.io_dict[name]= {'arg': var}
-        elif (func.attr == "placeholder"):
-          name = targets[0].id
-          shape = node.value.args[0].elts
-          length = len(shape)
-          if length == 1:
-            pass
-          elif length == 2:
-            placeholder = tvm.placeholder((shape[0].n, shape[1].n), name = name, dtype = "int32")
+                raise ValueError("Unknown/Unsupported keyowrds to tvm.placeholder: " + str(keyword[0]))
+            name = target.id
+            shape = self.get_shape(call.args[0])
+            placeholder = tvm.placeholder(shape, name = name, dtype = dtype)
             buff = tvm.decl_buffer(placeholder.shape, placeholder.dtype, placeholder.name)
-            self.buffer_dict[name] = {'tensor': placeholder, 'buffer': buff, 'ast': node, 'shape': (shape[0].n, shape[1].n)}
-          if name in self.arg_list:
-            self.io_dict[name] = {'arg': buff}
-        elif (func.attr == "compute"):
-          name = targets[0].id
-          shape_ast = None
-          shape = None
-          if isinstance(node.value.args[0], ast.Attribute):
-            assert(node.value.args[0].attr == "shape")
-            n = node.value.args[0].value.id
-            shape = self.buffer_dict[n]['tensor'].shape
-            tup = ast.Tuple([ast.Num(shape[0]), ast.Num(shape[1])], ast.Load())
-            shape_ast = tup
+            buffer = {'tensor': placeholder, 'buffer': buff, 'type': 'input', 'ast': node, 'shape': shape, 'allocated': False}
+            if name in self.arg_list:
+              self.io_dict[name] = {'arg': buff}
+              buffer['allocated'] = True
+            self.insert_buffer(name, buffer)
+            content = None
+          elif call_type[1] == "compute":
+            name = target.id
+            shape = self.get_shape(call.args[0])
+            placeholder = tvm.placeholder(shape, name = name, dtype = dtype)
+            buff = tvm.decl_buffer(placeholder.shape, placeholder.dtype, placeholder.name)
+            buffer = {'tensor': placeholder, 'buffer': buff, 'type': 'compute', 'ast': node, 'shape': shape, 'allocated': False}
+            if name in self.arg_list:
+              self.io_dict[name] = {'arg': buff}
+              buffer['allocated'] = True
+            self.insert_buffer(name, buffer)
+            lamb = call.args[1]
+            assert isinstance(lamb, ast.Lambda), "The second argument to tvm.compute must be a lambda function"
+            self.scope += 1
+            ret = self.visit(lamb)
+            args = lamb.args.args
+            if len(shape) == 1:
+              var_name = args[0].id
+              var = tvm.var(var_name, "int32")
+              st = tvm.make.Store(buff.data, ret, var, self.true)
+              if not isinstance(ret, tuple):
+                ret = self.ReplaceVar(var_name, var).mutate(ret)
+                st = tvm.make.Store(buff.data, ret, var, self.true)
+                content = tvm.make.For(var, 0, shape[0], 0, 0, st)
+              else:
+                ret[0] = self.ReplaceVar(var_name, var).mutate(ret[0])
+                ret[1] = self.ReplaceVar(var_name, var).mutate(ret[1])
+                st = tvm.make.Store(buff.data, ret[1], var, self.true)
+                content = tvm.make.For(var, 0, shape[0], 0, 0, tvm.make.Block(ret[0], st))
+            else:
+              var_name1 = args[0].id
+              var_name2 = args[1].id
+              var1 = tvm.var(var_name1, "int32")
+              var2 = tvm.var(var_name2, "int32")
+              if not isinstance(ret, tuple):
+                ret = self.ReplaceVar(var_name1, var1).mutate(ret)
+                ret = self.ReplaceVar(var_name2, var2).mutate(ret)
+                st = tvm.make.Store(buff.data, ret, (var1 * shape[1] + var2), self.true)
+                expr = tvm.make.For(var2, 0, shape[1], 0, 0, st)
+              else:
+                if ret[0] is not None:
+                  ret0 = self.ReplaceVar(var_name1, var1).mutate(ret[0])
+                  ret0 = self.ReplaceVar(var_name2, var2).mutate(ret0)
+                ret1 = self.ReplaceVar(var_name1, var1).mutate(ret[1])
+                ret1 = self.ReplaceVar(var_name2, var2).mutate(ret1)
+                st = tvm.make.Store(buff.data, ret1, (var1 * shape[1] + var2), self.true)
+                if ret[0] is not None:
+                  expr = tvm.make.For(var2, 0, shape[1], 0, 0, tvm.make.Block(ret0, st))
+                else:
+                  expr = tvm.make.For(var2, 0, shape[1], 0, 0, st)
+              content = tvm.make.For(var1, 0, shape[0], 0, 0, expr)
+              self.scope -= 1
           else:
-            shape = node.value.args[0].elts
-            shape = (shape[0].n, shape[1].n)
-            shape_ast = node.value.args[0]
-          lamb = node.value.args[1]
-          n = ast.Name("_internal", ast.Store())
-          c = ast.Call(func, [shape_ast, lamb], [], None, None)
-          ass = ast.Assign([n], c)
-          stmt = []
-          for v in self.var_dict:
-            if self.var_dict[v]['ast'] != None:
-              stmt.append(self.var_dict[v]['ast'])
-          for b in self.buffer_dict:
-            stmt.append(self.buffer_dict[b]['ast'])
-          for f in self.externs:
-            stmt.append(self.externs[f])
-          stmt.append(ass)
-          stmt = ast.Module(stmt)
-          ast.fix_missing_locations(stmt)
-
-          exec(compile(stmt, '<ast>', 'exec'), globals(), globals())
-
-          placeholder = tvm.placeholder(shape, name = name, dtype = "int32")
-          buff = tvm.decl_buffer(placeholder.shape, placeholder.dtype, placeholder.name)
-          f = func
-          f.attr = "placeholder"
-          c = ast.Call(f, [shape_ast], node.value.keywords, None, None)
-          ass = ast.Assign(targets, c)
-          self.buffer_dict[name] = {'tensor': placeholder, 'buffer': buff, 'ast': ass, 'shape': shape}
-
-          self.axis = _internal.op.axis
-          expr = self.replace_call_with_load( _internal.op.body[0])
-          ir = None
-          if len(self.axis) == 1:
-            index = self.axis[0].var
-            store = tvm.make.Store(buff.data, expr, index)
-            ir = tvm.make.For(self.axis[0].var, self.axis[0].dom.min, self.axis[0].dom.extent, 0, 0, store)
-          else:
-            index = self.axis[0].var * self.axis[1].dom.extent + self.axis[1].var
-            store = tvm.make.Store(buff.data, expr, index)
-            ir = tvm.make.For(self.axis[1].var, self.axis[1].dom.min, self.axis[1].dom.extent, 0, 0, store)
-            ir = tvm.make.For(self.axis[0].var, self.axis[0].dom.min, self.axis[0].dom.extent, 0, 0, ir)
-          print ir
-          return ir
-
-    else:
-      ir = self.visit(node.value)
-
-      pass
+            raise ValueError("Unkown/Unsupported tvm function: tvm." + call_type[1])
+          return content
+        else: # if call_type[1] == "tvm"
+          raise ValueError("Currently we only support tvm functions")
+    else: # if isinstance(node.value, ast.Call)
+      content = self.visit(node.value)
     # left hand side
-    if isinstance(target, ast.Name):
-      target = target.id
-      if target in self.var_dict:
-        target = self.var_dict[target]['var']
+    var, name, _type = self.get_target(target)
+    if _type == 'name':
+      if var is None:
+        var = tvm.var(name, "float32")
+        self.insert_var(name, {'var': var, 'type': 'intermediate', 'allocated': False})
       else:
-        var = tvm.var(target)
-        self.var_dict[target] = {'var': var, 'type': 'intermediate', 'allocated': False}
-        target = var
+        var = var['var']
     else:
-      assert isinstance(target, ast.Subscript)
       index = self.visit(target)
-      if isinstance(target.value, ast.Subscript): # 2D
-        target = target.value.value.id
-      else                                        # 1D
-        target = target.value.id
-      assert target in self.buffer_dict, "undeclared buffer " + target
-      target = self.buffer_dict[target]['buffer'].data
+      var = var['buffer'].data
 
+    assert (not is_tvm)
+    if isinstance(node.value, ast.IfExp):
+      then = tvm.make.Store(var, content[1], index)
+      orelse = tvm.make.Store(var, content[2], index)
+      return tvm.make.IfThenElse(content[0], then, orelse)
+    else:
+      return tvm.make.Store(var, content, index)
+
+  def visit_For(self, node):
+    """Visit for i in range(a, b)
+
+    Returns
+    -------
+    Stmt: For node
+    """
+    self.scope += 1
+    index = node.target.id
+    min_val = node.iter.args[0].n
+    max_val = node.iter.args[1].n
+    extent = max_val - min_val
+    tvm_var = tvm.var(index, "int32")
+    var = {'var': tvm_var, 'type': 'for', 'min': min_val, 'extent': extent, 'allocated': True}
+    self.insert_var(index, var)
+    stmt = self.visit_body(node.body)
+    '''
+    for_var = tvm.var("for_"+str(self.for_count), "int32")
+    stmt = self.ReplaceVar(index, for_var).mutate(stmt)
+    self.for_count += 1
+    '''
+    self.scope -= 1
+    return tvm.make.For(tvm_var, min_val, extent, 0, 0, stmt)
+
+  def visit_If(self, node):
+    cond = self.visit(node.test)
+    self.scope += 1
+    body = self.visit_body(node.body)
+    self.scope += 1
+    orelse = self.visit_body(node.orelse)
+    self.scope -= 2
+
+    return tvm.make.IfThenElse(cond, body, orelse)
+
+  """ Expressions """
+
+  def visit_BinOp(self, node):
+    # TODO: TYPE CHECK
+    left = self.visit(node.left)
+    right = self.visit(node.right)
+    op = node.op
+    if isinstance(op, ast.Add):
+      return tvm.make.Add(left, right)
+    elif isinstance(op, ast.Sub):
+      return tvm.make.Sub(left, right)
+    elif isinstance(op, ast.Mult):
+      return tvm.make.Mul(left, right)
+    elif isinstance(op, ast.Div):
+      return tvm.make.Div(left, right)
+    elif isinstance(op, ast.Mod):
+      return tvm.make.Mod(left, right)
+    elif isinstance(op, ast.Pow):
+      raise ValueError("tvm does not support power operation")
+    elif isinstance(op, ast.LShift):
+      return tvm.make.Call("float32", "shift_left", [left, right], tvm.expr.Call.PureIntrinsic, None, 0)
+    elif isinstance(op, ast.RShift):
+      return tvm.make.Call("float32", "shift_right", [left, right], tvm.expr.Call.PureIntrinsic, None, 0)
+    elif isinstance(op, ast.BitOr):
+      return tvm.make.Call("int32", "bitwise_or", [left, right], tvm.expr.Call.PureIntrinsic, None, 0)
+    elif isinstance(op, ast.BitXor):
+      return tvm.make.Call("int32", "bitwise_or", [left, right], tvm.expr.Call.PureIntrinsic, None, 0)
+    elif isinstance(op, ast.BitAnd):
+      return tvm.make.Call("int32", "bitwise_or", [left, right], tvm.expr.Call.PureIntrinsic, None, 0)
+    elif isinstance(op, ast.FloorDiv):
+      raise ValueError("tvm does not support floor division")
+    else:
+      raise ValueError("Unkown binary operation" + str(op))
+
+  def visit_UnaryOp(self, node):
+    operand = self.visit(node.operand)
+    op = node.op
+    if isinstance(op, ast.Invert):
+      return tvm.make.Call("int32", "bitwise_not", [operand], Call.PureIntrinsic, None, 0)
+    elif isinstance(op, ast.Not):
+      raise tvm.make.Not(operand)
+    elif isinstance(op, ast.UAdd):
+      return operand
+    elif isinstance(op, ast.USub):
+      return tvm.make.Mul(operand, -1)
+    else:
+      raise ValueError("Unkown unary operation" + str(op))
+
+  def visit_Lambda(self, node):
+    """Visit lambda x, y: expr
+
+    Returns
+    -------
+    Stmt, Expr
+    """
+    args = node.args.args
+    body = node.body
+    for arg in args:
+      assert isinstance(arg, ast.Name), "Argument to the lambda function must be a name"
+      name = arg.id
+      tvm_var = tvm.var(arg.id, dtype = "int32") #must be a for loop index
+      var = {'var': tvm_var, 'type': 'for', 'allocated': True}
+      self.insert_var(name, var)
+    return self.visit(body)
+
+  def visit_IfExp(self, node):
+    test = self.visit(node.test)
+    body = self.visit(node.body)
+    orelse = self.visit(node.orelse)
+    return test, body, orelse
+
+  def visit_Compare(self, node):
+    assert len(node.ops) == 1, "We only support one compare operator"
+    op = node.ops[0]
+    left = self.visit(node.left)
+    right = self.visit(node.comparators[0])
+    if isinstance(op, ast.Eq):
+      return tvm.make.EQ(left, right)
+    elif isinstance(op, ast.NotEq):
+      return tvm.make.NE(left, right)
+    elif isinstance(op, ast.Lt):
+      return tvm.make.LT(left, right)
+    elif isinstance(op, ast.LtE):
+      return tvm.make.LE(left, right)
+    elif isinstance(op, ast.Gt):
+      return tvm.make.GT(left, right)
+    elif isinstance(op, ast.GtE):
+      return tvm.make.GE(left, right)
+    else:
+      raise ValueError("Currently we do not support this operation: " + str(type(op)))
+
+  def visit_Call(self, node):
+    names = self.check_call_type(node)
+    name = '.'.join(names)
+    assert name in self.externs_dict, "Unknown external function: " + name
+    self.scope += 1
+    new_node = self.CallTransformer().enter(self.externs_dict[name], node.args)
+    ret = self.visit(new_node)
+    self.scope -= 1
+    return ret
+
+  def visit_Num(self, node):
+    return node.n
+
+  def visit_Subscript(self, node):
+    """Visit A[x] or A[x][y]
+
+    Returns
+    -------
+    Expr: x or x * extent + y
+    """
+    index = None
+    buffer = None
+    if isinstance(node.value, ast.Subscript):
+      # a 2D array
+      var2 = node.slice.value
+      if isinstance(var2, ast.Name):
+        var2 = self.get_var(var2.id)['var']
+      else:
+        var2 = var2.n
+      var1 = node.value.slice.value
+      if isinstance(var1, ast.Name):
+        var1 = self.get_var(var1.id)['var']
+      else:
+        var1 = var1.n
+      buffer_name = node.value.value.id
+      buffer = self.get_buffer(buffer_name)
+      buffer_shape = buffer['shape']
+      index = var1 * buffer_shape[1] + var2
+    else:
+      var = node.slice.value
+      if isinstance(var, ast.Name):
+        var = self.get_var(var.id)['var']
+      else:
+        var = var.n
+      buffer_name = node.value.id
+      buffer = self.get_buffer(buffer_name)
+      index = var
+    if isinstance(node.ctx, ast.Load):
+      # TODO: check data type
+      return tvm.make.Load(buffer['tensor'].dtype, buffer['buffer'].data, index, self.true)
+    else:
+      return index
+
+  def visit_Name(self, node):
+    name = node.id
+    var = self.get_var(name)
+    tvm_var = var['var']
+    if var['type'] == 'for':
+      return tvm_var
+    if isinstance(node.ctx, ast.Load):
+      return tvm.make.Load(tvm_var.dtype, tvm_var, 0, self.true)
+    else:
+      return tvm_var
 
   """Helper Functions"""
 
@@ -487,6 +551,67 @@ class Visitor(ast.NodeVisitor):
     else:
       return [node.func.id]
 
+  def get_shape(self, node):
+    """Get the shape from a function argument
+
+    Returns
+    -------
+    Tuple(shape[0], (shape[1]))
+    """
+    if isinstance(node, ast.Tuple):
+      shapes = node.elts
+      if len(shapes) == 1:
+        return (shapes[0].n,)
+      elif len(shapes) == 2:
+        return (shapes[0].n, shapes[1].n)
+      else:
+        raise ValueError("Currently we only support up to 2D arrays. You have " + str(len(shapes)) + " dimensions.")
+    elif isinstance(node, ast.Attribute):
+      assert(node.attr == "shape"), "Wrong attribute: " + node.attr + ", must be shape"
+      assert(isinstance(node.value, ast.Name)), "Wrong shape with " + str(node.value)
+      name = node.value.id
+      buffer = self.get_buffer(name)
+      return buffer['shape']
+
+  def get_target(self, target):
+    name = None
+    if isinstance(target, ast.Name):
+      name = target.id
+      var = self.get_var(name)
+      return var, name, 'name'
+    else:
+      assert isinstance(target, ast.Subscript)
+      if isinstance(target.value, ast.Subscript): # 2D
+        name = target.value.value.id
+      else:                                       # 1D
+        name = target.value.id
+      buffer = self.get_buffer(name)
+      return buffer, name, 'buffer'
+
+  def insert_var(self, name, var):
+    var['count'] = 0
+    self.var_dict[(name, self.scope)] = var
+
+  def get_var(self, name):
+    index = self.scope
+    while index >= 0:
+      if (name, index) in self.var_dict:
+        return self.var_dict[(name, index)]
+      else:
+        index -= 1
+    return None
+
+  def insert_buffer(self, name, buffer):
+    self.buffer_dict[(name, self.scope)] = buffer
+
+  def get_buffer(self, name):
+    index = self.scope
+    while index >= 0:
+      if (name, index) in self.buffer_dict:
+        return self.buffer_dict[(name, index)]
+      else:
+        index -= 1
+    return None
 
   def replace_call_with_load(self, node):
     if isinstance(node, tvm.expr.Call):
@@ -521,4 +646,45 @@ class Visitor(ast.NodeVisitor):
       return tvm.make.Add(a, b)
     else:
       return node
+
+  """Helper Class"""
+  class CallTransformer(ast.NodeTransformer):
+    def enter(self, node, args_out):
+      assert(isinstance(node, ast.FunctionDef))
+      args_in = node.args.args
+      self.args_in = []
+      for arg in args_in:
+        assert(isinstance(arg, ast.Name))
+        self.args_in.append(arg.id)
+      self.args_out = args_out
+      body = []
+      for b in node.body:
+        body.append(self.visit(b))
+      return ast.FunctionDef(node.name, node.args, body, node.decorator_list)
+
+    def visit_Name(self, node):
+      if node.id in self.args_in:
+        arg = self.args_out[self.args_in.index(node.id)]
+        if isinstance(arg, ast.Subscript):
+          return ast.Subscript(arg.value, arg.slice, node.ctx)
+        elif isinstance(arg, ast.Name):
+          return ast.Name(arg.id, node.ctx)
+        elif isinstance(arg, ast.Num):
+          return arg
+        else:
+          raise ValueError("Unkown argument type to the lambda function: " + str(type(arg)))
+      else:
+        return node
+
+  class ReplaceVar(IRMutator):
+    def __init__(self, name, var):
+      self.name = name
+      self.var = var
+
+    def mutate_Var(self, node):
+      if node.name == self.name:
+        return self.var
+      else:
+        return node
+
 

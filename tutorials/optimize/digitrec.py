@@ -27,16 +27,16 @@ def popcount(i):
 
 def popcount2(x, length):
   out = 0
-  for i in range(0, length):
+  for l in range(0, length):
     if x % 2 == 1:
-      out += 1
+      out = out + 1
     x = x >> 1
   return out
 
 def update_knn(dist, knn_row):
   max_id = 0
   max_dist = 0
-  for k in range(0, K):
+  for k in range(0, 3):
     max_id = k if knn_row[k] > max_dist else max_id
   if dist < max_dist:
     knn_row[max_id] = dist
@@ -45,22 +45,18 @@ def digitrec():
 
   input_image = tvm.var("input_image")
   labelval = tvm.placeholder((10, 100), name = 'labelval')
-  diff = tvm.compute(labelval.shape, lambda x, y: input_image ^ labelval[x, y], name = 'diff')
-  dist = tvm.compute((10, 100), lambda x, y: popcount(diff[x, y]), name = 'dist')
+  diff = tvm.compute(labelval.shape, lambda x, y: input_image ^ labelval[x][y], name = 'diff')
+  dist = tvm.compute((10, 100), lambda x, y: popcount2(diff[x][y], 49), name = 'dist')
 
   knn_mat = tvm.placeholder((10, 3), name = 'knn_mat')
   for i in range(0, 10):
     for j in range(0, 100):
-      max_id = 0
-      max_dist = 0
-      for k in range(0, 3):
-        max_id = k if knn_mat[i][k] > max_dist else max_id
-      if dist[i][j] < max_dist:
-        knn_mat[i][max_id] = dist[i][j]
+      update_knn(dist[i][j], knn_mat[i])
 
   #s = tvm.create_schedule(knn_mat.op)
 
-evaluator = mybuild(digitrec, extern_func = [popcount], args = ["input_image", "labelval", "knn_mat"])
+evaluator = mybuild(digitrec, extern_func = [popcount2, update_knn], args = ["input_image", "labelval", "knn_mat"])
+
 '''
 data = tvm.nd.array(numpy.random.rand(10, SIZE).astype(dtype), tvm.cpu(0))
 output = tvm.nd.array(numpy.zeros((10, K), dtype = dtype), tvm.cpu(0))
