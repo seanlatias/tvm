@@ -183,8 +183,6 @@ class Visitor(ast.NodeVisitor):
         # Not yet supported AST nodes: ClassDef, FunctionDef, Return, Print, While, With, Assert
         return self.visit_body(rest)
 
-  def visit_Expr(self, node):
-    return self.visit(node.value)
 
   """ Statements """
 
@@ -378,6 +376,9 @@ class Visitor(ast.NodeVisitor):
     self.scope -= 2
 
     return tvm.make.IfThenElse(cond, body, orelse)
+
+  def visit_Expr(self, node):
+    return self.visit(node.value)
 
   """ Expressions """
 

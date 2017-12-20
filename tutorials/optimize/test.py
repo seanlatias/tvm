@@ -1,5 +1,10 @@
 import tvm, inspect, ast, numpy
 
+a = tvm.var("a")
+a = a + 1
+a = a + 1
+print a
+
 
 A = tvm.placeholder((10,), name = "A", dtype = "int32")
 B = tvm.compute(A.shape, lambda x: A[x] + 1, name = "B")
